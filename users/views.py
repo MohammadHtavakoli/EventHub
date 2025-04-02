@@ -1,28 +1,24 @@
-from django.shortcuts import render
-from rest_framework import generics
+from rest_framework import generics, permissions
 from rest_framework.response import Response
-from rest_framework_simplejwt.tokens import RefreshToken
-from .models import CustomUser
-from .serializers import CustomUserSerializer, UserLoginSerializer
-from rest_framework.permissions import AllowAny
+from events.models import Event, Participant
+from events.serializers import EventSerializer
 
 
-# Create your views here.
-class RegisterUser(generics.CreateAPIView):
-    queryset = CustomUser.objects.all()
-    serializer_class = CustomUserSerializer
-    permission_classes = [AllowAny]
+class UserEventsView(generics.ListAPIView):
+    permission_classes = [permissions.IsAuthenticated]
+    serializer_class = EventSerializer
 
-class LoginUser(generics.CreateAPIView):
-    serializer_class = UserLoginSerializer
-    permission_classes = [AllowAny]
+    def get(self, request, *args, **kwargs):
+        # Get events created by the user
+        created_events = Event.objects.filter(creator=request.user)
+        created_serializer = EventSerializer(created_events, many=True)
 
-    def post(self, request, *args, **kwargs):
-        serializer = UserLoginSerializer(data=request.data)
-        serializer.is_valid(raise_exception=True)
-        user = serializer.validated_data['user']
-        refresh = RefreshToken.for_user(user)
+        # Get events joined by the user
+        joined_event_ids = Participant.objects.filter(user=request.user).values_list('event_id', flat=True)
+        joined_events = Event.objects.filter(id__in=joined_event_ids)
+        joined_serializer = EventSerializer(joined_events, many=True)
+
         return Response({
-            'refresh': str(refresh),
-            'access': str(refresh.access_token)
+            'created': created_serializer.data,
+            'joined': joined_serializer.data
         })
