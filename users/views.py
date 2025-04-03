@@ -1,24 +1,40 @@
-from rest_framework import generics, permissions
+from rest_framework import viewsets, status, permissions
 from rest_framework.response import Response
-from events.models import Event, Participant
-from events.serializers import EventSerializer
+from rest_framework.decorators import action
+from rest_framework_simplejwt.views import TokenObtainPairView
+from django.contrib.auth import get_user_model
+from .serializers import UserSerializer, UserCreateSerializer, CustomTokenObtainPairSerializer
+from .permissions import IsAdminUser, IsSelfOrAdmin
+
+User = get_user_model()
 
 
-class UserEventsView(generics.ListAPIView):
-    permission_classes = [permissions.IsAuthenticated]
-    serializer_class = EventSerializer
+class UserViewSet(viewsets.ModelViewSet):
+    queryset = User.objects.all()
+    serializer_class = UserSerializer
 
-    def get(self, request, *args, **kwargs):
-        # Get events created by the user
-        created_events = Event.objects.filter(creator=request.user)
-        created_serializer = EventSerializer(created_events, many=True)
+    def get_permissions(self):
+        if self.action == 'create':
+            permission_classes = [permissions.AllowAny]
+        elif self.action in ['update', 'partial_update', 'destroy']:
+            permission_classes = [IsSelfOrAdmin]
+        elif self.action == 'list':
+            permission_classes = [IsAdminUser]
+        else:
+            permission_classes = [permissions.IsAuthenticated]
+        return [permission() for permission in permission_classes]
 
-        # Get events joined by the user
-        joined_event_ids = Participant.objects.filter(user=request.user).values_list('event_id', flat=True)
-        joined_events = Event.objects.filter(id__in=joined_event_ids)
-        joined_serializer = EventSerializer(joined_events, many=True)
+    def get_serializer_class(self):
+        if self.action == 'create':
+            return UserCreateSerializer
+        return UserSerializer
 
-        return Response({
-            'created': created_serializer.data,
-            'joined': joined_serializer.data
-        })
+    @action(detail=False, methods=['get'], permission_classes=[permissions.IsAuthenticated])
+    def me(self, request): # Get current user details
+        serializer = self.get_serializer(request.user)
+        return Response(serializer.data)
+
+
+class CustomTokenObtainPairView(TokenObtainPairView):
+    serializer_class = CustomTokenObtainPairSerializer
+
