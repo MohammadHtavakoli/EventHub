@@ -1,245 +1,185 @@
-from django.db import transaction
-from django.db.models import Q, Count
-from django.shortcuts import get_object_or_404
-from django.utils import timezone
-from rest_framework import generics, permissions, status, filters
+from rest_framework import viewsets, status, permissions, filters
+from rest_framework.decorators import action
 from rest_framework.response import Response
-from rest_framework.views import APIView
+from django.db.models import Count, F, Q
+from django.utils import timezone
 from django_filters.rest_framework import DjangoFilterBackend
-from .models import Event, Participant, EventLog
-from .serializers import EventSerializer, ParticipantSerializer, EventLogSerializer
-from .permissions import IsEventCreatorOrReadOnly, IsEventCreator, IsAdminOrCreator
+from .models import Event, Participant
+from .serializers import (
+    EventSerializer, EventDetailSerializer,
+    ParticipantSerializer, ParticipantCreateSerializer
+)
+from .permissions import IsEventCreatorOrReadOnly
+from .filters import EventFilter
+from users.permissions import IsAdminUser, IsEventCreator
+from logs.models import EventLog
 
 
-class EventListCreateView(generics.ListCreateAPIView):
+class EventViewSet(viewsets.ModelViewSet):
+    queryset = Event.objects.annotate(
+        participant_count=Count('participants')
+    ).select_related('creator')
     serializer_class = EventSerializer
     filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
-    filterset_fields = ['status']
+    filterset_class = EventFilter
     search_fields = ['name', 'description', 'location']
-    ordering_fields = ['date', 'created_at', 'name']
-    ordering = ['date']
-
-    def get_permissions(self):
-        if self.request.method == 'POST':
-            return [permissions.IsAuthenticated(), IsAdminOrCreator()]
-        return [permissions.AllowAny()]
+    ordering_fields = ['date', 'created_at', 'name', 'participant_count']
+    ordering = ['-date']
 
     def get_queryset(self):
-        queryset = Event.objects.annotate(
-            participant_count=Count('participants')
-        )
+        """
+        Filter events based on user role and request parameters
+        """
+        queryset = super().get_queryset()
 
-        # Filter by date
-        date_filter = self.request.query_params.get('date')
-        if date_filter:
-            try:
-                filter_date = timezone.datetime.fromisoformat(date_filter.replace('Z', '+00:00'))
-                queryset = queryset.filter(date__gte=filter_date)
-            except ValueError:
-                pass
+        # Filter by user's joined events
+        joined = self.request.query_params.get('joined', None)
+        if joined and self.request.user.is_authenticated:
+            queryset = queryset.filter(participants__user=self.request.user)
 
-        # Filter by available capacity
-        capacity_filter = self.request.query_params.get('capacity')
-        if capacity_filter and capacity_filter.lower() == 'true':
-            queryset = queryset.filter(participant_count__lt=models.F('capacity'))
+        # Filter by user's created events
+        created = self.request.query_params.get('created', None)
+        if created and self.request.user.is_authenticated:
+            queryset = queryset.filter(creator=self.request.user)
+
+        # For non-authenticated users, only show open events
+        if not self.request.user.is_authenticated:
+            queryset = queryset.filter(status=Event.Status.OPEN)
 
         return queryset
 
-    def perform_create(self, serializer):
-        # Check if user has reached the limit of open events
-        if self.request.user.role != 'admin':
-            open_events_count = Event.objects.filter(
-                creator=self.request.user,
-                status='open'
-            ).count()
+    def get_permissions(self):
+        """
+        Instantiates and returns the list of permissions that this view requires.
+        """
+        if self.action in ['create']:
+            permission_classes = [IsEventCreator]
+        elif self.action in ['update', 'partial_update', 'destroy']:
+            permission_classes = [IsEventCreatorOrReadOnly]
+        elif self.action in ['participants']:
+            permission_classes = [permissions.IsAuthenticated, IsEventCreatorOrReadOnly]
+        else:
+            permission_classes = [permissions.AllowAny]
+        return [permission() for permission in permission_classes]
 
-            # Limit to 5 open events for non-admin users
-            if open_events_count >= 5:
-                return Response(
-                    {"detail": "You have reached the maximum number of open events."},
-                    status=status.HTTP_400_BAD_REQUEST
-                )
+    def get_serializer_class(self):
+        """
+        Return appropriate serializer class
+        """
+        if self.action == 'retrieve':
+            return EventDetailSerializer
+        return EventSerializer
 
-        with transaction.atomic():
-            event = serializer.save(creator=self.request.user)
-
-            # Create log entry
-            EventLog.objects.create(
-                event=event,
-                user=self.request.user,
-                action='create',
-                details={'event_id': event.id, 'event_name': event.name}
-            )
-
-
-class EventDetailView(generics.RetrieveUpdateDestroyAPIView):
-    queryset = Event.objects.all()
-    serializer_class = EventSerializer
-    permission_classes = [IsEventCreatorOrReadOnly]
-
-    def perform_update(self, serializer):
-        with transaction.atomic():
-            event = serializer.save()
-
-            # Create log entry
-            EventLog.objects.create(
-                event=event,
-                user=self.request.user,
-                action='update',
-                details={
-                    'event_id': event.id,
-                    'event_name': event.name,
-                    'updated_fields': list(serializer.validated_data.keys())
-                }
-            )
-
-    def destroy(self, request, *args, **kwargs):
-        event = self.get_object()
-
-        # Check if event has participants
-        if event.participants.exists():
+    def perform_destroy(self, instance):
+        """
+        Check if event can be deleted
+        """
+        if not instance.can_be_deleted:
             return Response(
                 {"detail": "Cannot delete an event with participants."},
                 status=status.HTTP_400_BAD_REQUEST
             )
+        instance.delete()
 
-        with transaction.atomic():
-            # Store event details for logging
-            event_details = {
-                'event_id': event.id,
-                'event_name': event.name
-            }
+    @action(detail=True, methods=['get'])
+    def participants(self, request, pk=None):
+        """
+        Get participants of an event
+        """
+        event = self.get_object()
 
-            # Delete the event
-            event.delete()
-
-            # Create log entry
-            EventLog.objects.create(
-                event=None,  # Event is deleted
-                user=request.user,
-                action='delete',
-                details=event_details
-            )
-
-            return Response(status=status.HTTP_204_NO_CONTENT)
-
-
-class EventParticipantsView(generics.ListAPIView):
-    serializer_class = ParticipantSerializer
-    permission_classes = [permissions.IsAuthenticated, IsEventCreator]
-
-    def get_queryset(self):
-        event = get_object_or_404(Event, pk=self.kwargs['pk'])
-        self.check_object_permissions(self.request, event)
-        return Participant.objects.filter(event=event)
-
-
-class JoinEventView(APIView):
-    permission_classes = [permissions.IsAuthenticated]
-
-    def post(self, request, pk):
-        event = get_object_or_404(Event, pk=pk)
-
-        # Check if event is open
-        if event.status != 'open':
+        # Only event creator or admin can see participants
+        if not (request.user == event.creator or request.user.is_admin):
             return Response(
-                {"detail": "Event is not open for registration."},
-                status=status.HTTP_400_BAD_REQUEST
+                {"detail": "You do not have permission to view participants."},
+                status=status.HTTP_403_FORBIDDEN
             )
 
-        # Check if event is full
-        if event.is_full:
-            return Response(
-                {"detail": "Event has reached its capacity."},
-                status=status.HTTP_400_BAD_REQUEST
-            )
+        participants = event.participants.all()
+        serializer = ParticipantSerializer(participants, many=True)
+        return Response(serializer.data)
 
-        # Check if user is already a participant
-        if Participant.objects.filter(event=event, user=request.user).exists():
-            return Response(
-                {"detail": "You are already registered for this event."},
-                status=status.HTTP_400_BAD_REQUEST
-            )
+    @action(detail=True, methods=['post'], permission_classes=[permissions.IsAuthenticated])
+    def join(self, request, pk=None):
+        """
+        Join an event
+        """
+        event = self.get_object()
 
-        with transaction.atomic():
-            # Create participant
-            participant = Participant.objects.create(
-                event=event,
-                user=request.user
-            )
+        # Create serializer with event
+        serializer = ParticipantCreateSerializer(
+            data={'event': event.id},
+            context={'request': request}
+        )
 
-            # Create log entry
+        if serializer.is_valid():
+            participant = serializer.save()
+
+            # Log the event
             EventLog.objects.create(
                 event=event,
                 user=request.user,
-                action='join',
-                details={
-                    'event_id': event.id,
-                    'event_name': event.name,
-                    'participant_id': participant.id
-                }
+                action='JOIN',
+                description=f"User {request.user.email} joined event {event.name}"
             )
 
             return Response(
-                {"detail": "Successfully joined the event."},
+                ParticipantSerializer(participant).data,
                 status=status.HTTP_201_CREATED
             )
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
+    @action(detail=True, methods=['post'], permission_classes=[permissions.IsAuthenticated])
+    def leave(self, request, pk=None):
+        """
+        Leave an event
+        """
+        event = self.get_object()
 
-class LeaveEventView(APIView):
-    permission_classes = [permissions.IsAuthenticated]
-
-    def post(self, request, pk):
-        event = get_object_or_404(Event, pk=pk)
-
-        # Check if user is a participant
-        participant = get_object_or_404(Participant, event=event, user=request.user)
-
-        with transaction.atomic():
-            # Store participant details for logging
-            participant_details = {
-                'event_id': event.id,
-                'event_name': event.name,
-                'participant_id': participant.id
-            }
-
-            # Delete participant
-            participant.delete()
-
-            # Create log entry
-            EventLog.objects.create(
-                event=event,
-                user=request.user,
-                action='leave',
-                details=participant_details
-            )
-
+        try:
+            participant = Participant.objects.get(event=event, user=request.user)
+        except Participant.DoesNotExist:
             return Response(
-                {"detail": "Successfully left the event."},
-                status=status.HTTP_200_OK
+                {"detail": "You are not a participant of this event."},
+                status=status.HTTP_400_BAD_REQUEST
             )
 
+        participant.delete()
 
-class EventLogsView(generics.ListAPIView):
-    serializer_class = EventLogSerializer
-    permission_classes = [permissions.IsAuthenticated, IsEventCreator]
+        # Log the event
+        EventLog.objects.create(
+            event=event,
+            user=request.user,
+            action='LEAVE',
+            description=f"User {request.user.email} left event {event.name}"
+        )
 
-    def get_queryset(self):
-        event = get_object_or_404(Event, pk=self.kwargs['pk'])
-        self.check_object_permissions(self.request, event)
-        return EventLog.objects.filter(event=event)
+        return Response(status=status.HTTP_204_NO_CONTENT)
 
 
-class AdminEventLogsView(generics.ListAPIView):
-    serializer_class = EventLogSerializer
+class ParticipantViewSet(viewsets.ReadOnlyModelViewSet):
+    """
+    ViewSet for Participant model (read-only)
+    """
+    serializer_class = ParticipantSerializer
     permission_classes = [permissions.IsAuthenticated]
 
-    def get_permissions(self):
-        if not self.request.user.is_authenticated:
-            return [permissions.IsAuthenticated()]
-        if self.request.user.role != 'admin':
-            return [permissions.IsAdminUser()]
-        return [permissions.IsAuthenticated()]
-
     def get_queryset(self):
-        return EventLog.objects.all()
+        """
+        Filter participants based on user role
+        """
+        user = self.request.user
+
+        # Admin can see all participants
+        if user.is_admin:
+            return Participant.objects.all().select_related('user', 'event')
+
+        # Event creators can see participants of their events
+        if user.is_event_creator:
+            return Participant.objects.filter(
+                event__creator=user
+            ).select_related('user', 'event')
+
+        # Regular users can see their own participations
+        return Participant.objects.filter(user=user).select_related('user', 'event')
+
