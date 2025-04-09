@@ -27,9 +27,6 @@ class EventViewSet(viewsets.ModelViewSet):
     ordering = ['-date']
 
     def get_queryset(self):
-        """
-        Filter events based on user role and request parameters
-        """
         queryset = super().get_queryset()
 
         # Filter by user's joined events
@@ -49,9 +46,6 @@ class EventViewSet(viewsets.ModelViewSet):
         return queryset
 
     def get_permissions(self):
-        """
-        Instantiates and returns the list of permissions that this view requires.
-        """
         if self.action in ['create']:
             permission_classes = [IsEventCreator]
         elif self.action in ['update', 'partial_update', 'destroy']:
@@ -63,17 +57,11 @@ class EventViewSet(viewsets.ModelViewSet):
         return [permission() for permission in permission_classes]
 
     def get_serializer_class(self):
-        """
-        Return appropriate serializer class
-        """
         if self.action == 'retrieve':
             return EventDetailSerializer
         return EventSerializer
 
     def perform_destroy(self, instance):
-        """
-        Check if event can be deleted
-        """
         if not instance.can_be_deleted:
             return Response(
                 {"detail": "Cannot delete an event with participants."},
@@ -83,9 +71,6 @@ class EventViewSet(viewsets.ModelViewSet):
 
     @action(detail=True, methods=['get'])
     def participants(self, request, pk=None):
-        """
-        Get participants of an event
-        """
         event = self.get_object()
 
         # Only event creator or admin can see participants
@@ -101,9 +86,6 @@ class EventViewSet(viewsets.ModelViewSet):
 
     @action(detail=True, methods=['post'], permission_classes=[permissions.IsAuthenticated])
     def join(self, request, pk=None):
-        """
-        Join an event
-        """
         event = self.get_object()
 
         # Create serializer with event
@@ -131,9 +113,6 @@ class EventViewSet(viewsets.ModelViewSet):
 
     @action(detail=True, methods=['post'], permission_classes=[permissions.IsAuthenticated])
     def leave(self, request, pk=None):
-        """
-        Leave an event
-        """
         event = self.get_object()
 
         try:
@@ -158,16 +137,10 @@ class EventViewSet(viewsets.ModelViewSet):
 
 
 class ParticipantViewSet(viewsets.ReadOnlyModelViewSet):
-    """
-    ViewSet for Participant model (read-only)
-    """
     serializer_class = ParticipantSerializer
     permission_classes = [permissions.IsAuthenticated]
 
     def get_queryset(self):
-        """
-        Filter participants based on user role
-        """
         user = self.request.user
 
         # Admin can see all participants
